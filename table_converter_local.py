@@ -56,7 +56,7 @@ def extract_tables_local(image_path: str,
     if progress_cb:
         progress_cb("Loading EasyOCR model (first run downloads ~100 MB)…")
 
-    ocr = EasyOCR(lang=["en"], gpu=False)
+    ocr = EasyOCR(lang=["en"])
 
     if progress_cb:
         progress_cb("Detecting and reading table…")
