@@ -19,7 +19,7 @@ except ImportError:
     HAS_DND = False
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageEnhance, ImageFilter
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -40,6 +40,36 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────
+#  Image preprocessing
+# ─────────────────────────────────────────────
+
+def preprocess_image(image_path: str) -> str:
+    """
+    Upscale 2x, sharpen, and boost contrast so EasyOCR reads small
+    text more reliably. Returns path to a temporary PNG.
+    """
+    import tempfile
+    img = Image.open(image_path).convert("RGB")
+
+    # Upscale 2x with high-quality resampling
+    img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+
+    # Unsharp mask to crisp up glyph edges
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=2))
+
+    # Boost contrast slightly
+    img = ImageEnhance.Contrast(img).enhance(1.4)
+
+    # Boost sharpness
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp.name, "PNG")
+    tmp.close()
+    return tmp.name
+
+
+# ─────────────────────────────────────────────
 #  Table extraction (local OCR)
 # ─────────────────────────────────────────────
 
@@ -50,6 +80,7 @@ def extract_tables_local(image_path: str,
     Uses img2table + EasyOCR — no API key required.
     EasyOCR downloads its model (~100 MB) on first run.
     """
+    import os
     from img2table.document import Image as Img2Image
     from img2table.ocr import EasyOCR
 
@@ -59,16 +90,24 @@ def extract_tables_local(image_path: str,
     ocr = EasyOCR(lang=["en"])
 
     if progress_cb:
+        progress_cb("Preprocessing image for better OCR accuracy…")
+
+    processed_path = preprocess_image(image_path)
+
+    if progress_cb:
         progress_cb("Detecting and reading table…")
 
-    doc = Img2Image(src=image_path)
-    result = doc.extract_tables(
-        ocr=ocr,
-        implicit_rows=True,
-        implicit_columns=True,
-        borderless_tables=False,
-        min_confidence=50,
-    )
+    try:
+        doc = Img2Image(src=processed_path)
+        result = doc.extract_tables(
+            ocr=ocr,
+            implicit_rows=True,
+            implicit_columns=True,
+            borderless_tables=False,
+            min_confidence=30,
+        )
+    finally:
+        os.unlink(processed_path)
 
     tables = []
     for tbl in (result if isinstance(result, list) else result.values()):
