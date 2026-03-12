@@ -71,7 +71,7 @@ def extract_tables_local(image_path: str,
     )
 
     tables = []
-    for tbl in result.values():
+    for tbl in (result if isinstance(result, list) else result.values()):
         if tbl is None:
             continue
         df = tbl.df
