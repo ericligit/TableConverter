@@ -43,10 +43,42 @@ except ImportError:
 #  Image preprocessing
 # ─────────────────────────────────────────────
 
+def to_png(image_path: str) -> str:
+    """Convert image to a temporary PNG without any other processing."""
+    import tempfile
+    img = Image.open(image_path).convert("RGB")
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp.name, "PNG")
+    tmp.close()
+    return tmp.name
+
+
+def to_grayscale_png(image_path: str) -> str:
+    """
+    Convert image to high-contrast grayscale.
+
+    Colored table backgrounds (e.g. alternating red/green/yellow rows) create
+    false vertical edges that mislead img2table's border detector, producing
+    phantom columns.  Stripping color removes those false edges so that only
+    the real grid lines remain visible.
+    """
+    import tempfile
+    img = Image.open(image_path).convert("L")          # true grayscale
+    img = ImageEnhance.Contrast(img).enhance(2.0)      # make borders pop
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img.save(tmp.name, "PNG")
+    tmp.close()
+    return tmp.name
+
+
 def preprocess_image(image_path: str) -> str:
     """
     Upscale 2x, sharpen, and boost contrast so EasyOCR reads small
     text more reliably. Returns path to a temporary PNG.
+
+    NOTE: only use this when the original resolution is too small for OCR.
+    The 2x upscale can break img2table's fixed-kernel border detection,
+    so always try the original image first.
     """
     import tempfile
     img = Image.open(image_path).convert("RGB")
@@ -73,55 +105,176 @@ def preprocess_image(image_path: str) -> str:
 #  Table extraction (local OCR)
 # ─────────────────────────────────────────────
 
+def _easyocr_direct(image_path: str) -> list[list[str]]:
+    """
+    Reconstruct a table purely from EasyOCR text bounding-box positions —
+    no border / line detection involved.
+
+    Works for any table regardless of cell background colour (heat-map
+    tables, alternating-row colour tables, etc.) because colour never
+    enters the algorithm.
+
+    Algorithm
+    ---------
+    1. Run EasyOCR → (bbox, text, confidence) triples.
+    2. Cluster text blocks into rows by vertical (y-centre) proximity,
+       using average glyph height as the tolerance.
+    3. Find column anchor positions from the densest row (usually the header).
+    4. Assign every text block to its nearest column anchor.
+    """
+    import easyocr
+
+    reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    results = reader.readtext(image_path, detail=1, paragraph=False)
+
+    if not results:
+        return []
+
+    items = []
+    for bbox, text, conf in results:
+        text = text.strip()
+        if not text or conf < 0.15:
+            continue
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        items.append({
+            "text": text,
+            "cx":   (min(xs) + max(xs)) / 2,
+            "cy":   (min(ys) + max(ys)) / 2,
+            "h":    max(ys) - min(ys),
+        })
+
+    if not items:
+        return []
+
+    # ── Cluster into rows ────────────────────────────────────────────────────
+    items.sort(key=lambda i: i["cy"])
+    avg_h   = sum(i["h"] for i in items) / len(items)
+    row_tol = avg_h * 0.65      # items within this Δy share a row
+
+    rows_raw: list[list[dict]] = [[items[0]]]
+    for item in items[1:]:
+        row_cy = sum(i["cy"] for i in rows_raw[-1]) / len(rows_raw[-1])
+        if abs(item["cy"] - row_cy) <= row_tol:
+            rows_raw[-1].append(item)
+        else:
+            rows_raw.append([item])
+
+    for row in rows_raw:
+        row.sort(key=lambda i: i["cx"])
+
+    # ── Determine column anchor positions from the fullest row ───────────────
+    anchor   = max(rows_raw, key=len)
+    col_cx   = [item["cx"] for item in anchor]
+    n_cols   = len(col_cx)
+
+    if n_cols == 0:
+        return []
+
+    def _nearest(cx: float) -> int:
+        return min(range(n_cols), key=lambda j: abs(col_cx[j] - cx))
+
+    # ── Build grid ───────────────────────────────────────────────────────────
+    table: list[list[str]] = []
+    for row in rows_raw:
+        cells = [""] * n_cols
+        for item in row:
+            j = _nearest(item["cx"])
+            cells[j] = (cells[j] + " " + item["text"]).strip() if cells[j] else item["text"]
+        table.append(cells)
+
+    return table
+
+
 def extract_tables_local(image_path: str,
                          progress_cb=None) -> list[list[list[str]]]:
     """
     Returns a list of tables; each table is a list-of-lists of strings.
-    Uses img2table + EasyOCR — no API key required.
+
+    Strategy order
+    --------------
+    1. EasyOCR-direct  — position-based clustering; immune to cell colours.
+    2. img2table + grayscale PNG — grayscale removes colour noise from the
+       border detector; good for tables with visible grid lines.
+    3. img2table + borderless mode — for tables without visible borders.
+    4. img2table + upscaled image — last resort for very small images.
+
     EasyOCR downloads its model (~100 MB) on first run.
     """
     import os
     from img2table.document import Image as Img2Image
-    from img2table.ocr import EasyOCR
+    from img2table.ocr import EasyOCR as Img2EasyOCR
 
+    # ── Strategy 1: EasyOCR-direct ───────────────────────────────────────────
+    # Reconstructs table structure from text positions alone; no border
+    # detection → unaffected by coloured cell backgrounds.
     if progress_cb:
-        progress_cb("Loading EasyOCR model (first run downloads ~100 MB)…")
-
-    ocr = EasyOCR(lang=["en"])
-
-    if progress_cb:
-        progress_cb("Preprocessing image for better OCR accuracy…")
-
-    processed_path = preprocess_image(image_path)
-
-    if progress_cb:
-        progress_cb("Detecting and reading table…")
-
+        progress_cb("Detecting table via text-position clustering (pass 1/4)…")
     try:
-        doc = Img2Image(src=processed_path)
-        result = doc.extract_tables(
+        table = _easyocr_direct(image_path)
+        if table:
+            return [table]
+    except Exception:
+        pass
+
+    # ── img2table fallback strategies ────────────────────────────────────────
+    if progress_cb:
+        progress_cb("Loading img2table OCR model (pass 2/4)…")
+    ocr = Img2EasyOCR(lang=["en"])
+
+    def _run(proc_path, borderless):
+        doc = Img2Image(src=proc_path)
+        return doc.extract_tables(
             ocr=ocr,
             implicit_rows=True,
             implicit_columns=True,
-            borderless_tables=False,
+            borderless_tables=borderless,
             min_confidence=30,
         )
-    finally:
-        os.unlink(processed_path)
 
-    tables = []
-    for tbl in (result if isinstance(result, list) else result.values()):
-        if tbl is None:
-            continue
-        df = tbl.df
-        # Replace NaN with ""
-        df = df.fillna("")
-        rows = [list(df.columns.astype(str))] + df.values.tolist()
-        rows = [[str(cell) for cell in row] for row in rows]
-        # Drop auto-generated integer column headers if they look like 0,1,2...
-        if rows and all(h.isdigit() for h in rows[0]):
-            rows = rows[1:]
-        tables.append(rows)
+    def _parse(result):
+        tables = []
+        for tbl in (result if isinstance(result, list) else result.values()):
+            if tbl is None:
+                continue
+            df = tbl.df.fillna("")
+            rows = [list(df.columns.astype(str))] + df.values.tolist()
+            rows = [[str(c) for c in row] for row in rows]
+            if rows and all(h.isdigit() for h in rows[0]):
+                rows = rows[1:]
+            tables.append(rows)
+        return tables
+
+    # Strategy 2: grayscale — strips colour noise so only real grid lines remain
+    if progress_cb:
+        progress_cb("Retrying with grayscale image (pass 2/4)…")
+    proc2 = to_grayscale_png(image_path)
+    try:
+        tables = _parse(_run(proc2, borderless=False))
+    finally:
+        os.unlink(proc2)
+    if tables:
+        return tables
+
+    # Strategy 3: borderless mode — for tables without visible borders
+    if progress_cb:
+        progress_cb("Retrying in borderless mode (pass 3/4)…")
+    proc3 = to_png(image_path)
+    try:
+        tables = _parse(_run(proc3, borderless=True))
+    finally:
+        os.unlink(proc3)
+    if tables:
+        return tables
+
+    # Strategy 4: upscaled + sharpened — for very small / low-res source images
+    if progress_cb:
+        progress_cb("Retrying with upscaled image (pass 4/4)…")
+    proc4 = preprocess_image(image_path)
+    try:
+        tables = _parse(_run(proc4, borderless=False))
+    finally:
+        os.unlink(proc4)
 
     return tables
 
